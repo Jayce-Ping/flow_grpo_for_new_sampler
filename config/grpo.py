@@ -1,7 +1,7 @@
 import ml_collections
 import imp
 import os
-
+import math
 base = imp.load_source("base", os.path.join(os.path.dirname(__file__), "base.py"))
 
 def compressibility():
@@ -94,7 +94,28 @@ def general_ocr_sd3():
     config.resolution = 512
     config.sample.train_batch_size = 9
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # 16 is a special design, the test set has a total of 1018, to make 8*16*n as close as possible to 1018, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -136,7 +157,28 @@ def geneval_sd3():
     config.resolution = 512
     config.sample.train_batch_size = 9
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 14 # This bs is a special design, the test set has a total of 2212, to make gpu_num*bs*n as close as possible to 2212, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -174,7 +216,28 @@ def pickscore_sd3():
     config.resolution = 512
     config.sample.train_batch_size = 9
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -212,7 +275,28 @@ def clipscore_sd3():
     config.resolution = 512
     config.sample.train_batch_size = 9
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -292,7 +376,28 @@ def general_ocr_sd3_4gpu():
     config.resolution = 512
     config.sample.train_batch_size = 8
     config.sample.num_image_per_prompt = 16
-    config.sample.num_batches_per_epoch = int(16/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 16
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # 16 is a special design, the test set has a total of 1018, to make 8*16*n as close as possible to 1018, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -333,7 +438,28 @@ def pickscore_sd3_4gpu():
     config.resolution = 512
     config.sample.train_batch_size = 8
     config.sample.num_image_per_prompt = 16
-    config.sample.num_batches_per_epoch = int(16/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 16
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -371,7 +497,28 @@ def general_ocr_sd3_1gpu():
     config.resolution = 512
     config.sample.train_batch_size = 8
     config.sample.num_image_per_prompt = 8
-    config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 8
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # 16 is a special design, the test set has a total of 1018, to make 8*16*n as close as possible to 1018, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -411,7 +558,28 @@ def pickscore_flux():
     config.resolution = 512
     config.sample.train_batch_size = 3
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -451,7 +619,28 @@ def pickscore_flux_8gpu():
     config.resolution = 512
     config.sample.train_batch_size = 3
     config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -492,7 +681,28 @@ def counting_flux_kontext():
     config.resolution = 512
     config.sample.train_batch_size = 3
     config.sample.num_image_per_prompt = 21
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.unique_prompt_per_epoch = 48
+    config.sample.sample_num_per_epoch = math.lcm(
+        config.sample.num_image_per_prompt * config.sample.unique_prompt_per_epoch,
+        gpu_number * config.sample.train_batch_size
+    ) # Total number of sample on all processes, to make sure all unique prompts are included `num_image_per_prompt` times.
+
+    # Update number of unique prompt per epoch and check balance
+    unique_prompt_per_epoch = config.sample.sample_num_per_epoch // config.sample.num_image_per_prompt
+    num_image_per_prompt = config.sample.sample_num_per_epoch // config.sample.unique_prompt_per_epoch
+    # The following warning is not necessary, but explicitly acknowledges this change.
+    # It can be commented, then the sampler will update `unique_prompt_per_epoch` automatically.
+    assert unique_prompt_per_epoch == config.sample.unique_prompt_per_epoch and num_image_per_prompt == config.sample.num_image_per_prompt, \
+        f""" Current setting:
+            config.sample.unique_prompt_per_epoch={config.sample.unique_prompt_per_epoch}
+            config.sample.num_image_per_prompt={config.sample.num_image_per_prompt}
+            requires total sample number per epoch to be multiplies of {config.sample.unique_prompt_per_epoch}*{config.sample.num_image_per_prompt}={config.sample.unique_prompt_per_epoch*config.sample.num_image_per_prompt},
+            which is not a multiple of sample_batch_size*gpu_number={config.sample.train_batch_size*gpu_number} and will cause unbalanced sampling.
+            Consider to set config.sample.unique_prompt_per_epoch to be {unique_prompt_per_epoch},
+            or config.sample.num_image_per_prompt to be {num_image_per_prompt}.
+        """
+    config.sample.num_batches_per_epoch = int(config.sample.sample_num_per_epoch / (gpu_number * config.sample.train_batch_size))
+
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 2 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 

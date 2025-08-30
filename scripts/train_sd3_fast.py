@@ -588,7 +588,6 @@ def main(_):
 
     epoch = 0
     global_step = 0
-    train_iter = iter(train_dataloader)
 
     while True:
         #################### EVAL ####################
@@ -609,6 +608,7 @@ def main(_):
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
+            train_iter = iter(train_dataloader)
             prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(

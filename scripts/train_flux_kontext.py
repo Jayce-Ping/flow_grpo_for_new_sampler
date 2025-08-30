@@ -22,6 +22,7 @@ import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.sampler import DistributedKRepeatSampler
 from flow_grpo.diffusers_patch.flux_kontext_pipeline_with_logprob import pipeline_with_logprob
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
@@ -73,50 +74,6 @@ class GenevalPromptImageDataset(Dataset):
         images = [example["image"] for example in examples]
         prompt_with_image_paths = [example["prompt_with_image_path"] for example in examples]
         return prompts, metadatas, images, prompt_with_image_paths
-
-class DistributedKRepeatSampler(Sampler):
-    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
-        self.dataset = dataset
-        self.batch_size = batch_size  # Batch size per replica
-        self.k = k                    # Number of repetitions per sample
-        self.num_replicas = num_replicas  # Total number of replicas
-        self.rank = rank              # Current replica rank
-        self.seed = seed              # Random seed for synchronization
-        
-        # Compute the number of unique samples needed per iteration
-        self.total_samples = self.num_replicas * self.batch_size
-        assert self.total_samples % self.k == 0, f"k can not divide n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
-        self.m = self.total_samples // self.k  # Number of unique samples
-        self.epoch = 0
-
-    def __iter__(self):
-        while True:
-            # Generate a deterministic random sequence to ensure all replicas are synchronized
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            
-            # Randomly select m unique samples
-            indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
-            
-            # Repeat each sample k times to generate n*b total samples
-            repeated_indices = [idx for idx in indices for _ in range(self.k)]
-            
-            # Shuffle to ensure uniform distribution
-            shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
-            shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
-            
-            # Split samples to each replica
-            per_card_samples = []
-            for i in range(self.num_replicas):
-                start = i * self.batch_size
-                end = start + self.batch_size
-                per_card_samples.append(shuffled_samples[start:end])
-            
-            # Return current replica's sample indices
-            yield per_card_samples[self.rank]
-    
-    def set_epoch(self, epoch):
-        self.epoch = epoch  # Used to synchronize random state across epochs
 
 
 def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_length, device):
@@ -360,7 +317,7 @@ def main(_):
         #     config=config.to_dict(),
         #     init_kwargs={"wandb": {"name": config.run_name}},
         # )
-    logger.info(f"\n{config}")
+    # logger.info(f"\n{config}")
 
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
@@ -473,6 +430,7 @@ def main(_):
         dataset=train_dataset,
         batch_size=config.sample.train_batch_size,
         k=config.sample.num_image_per_prompt,
+        m=config.sample.unique_sample_per_epoch,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
         seed=42
@@ -492,6 +450,10 @@ def main(_):
         shuffle=False,
         num_workers=8,
     )
+
+    if config.sample.unique_prompt_per_epoch != train_sampler.m:
+        logger.info(f"For sampling balance, `config.sample.unique_prompt_per_epoch` changed from {config.sample.unique_prompt_per_epoch} to {train_sampler.m}!")
+        config.sample.unique_prompt_per_epoch = train_sampler.m
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -535,6 +497,8 @@ def main(_):
         * accelerator.num_processes
         * config.train.gradient_accumulation_steps
     )
+    # Move `config` log here, after all potential changes
+    logger.info(f"\n{config}")
 
     logger.info("***** Running training *****")
     logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
