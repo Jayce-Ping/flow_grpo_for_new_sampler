@@ -729,8 +729,8 @@ def main(_):
                     }
                 )
 
-        if epoch < 2:
-            continue
+        # if epoch < 2:
+        #     continue
         # wait for all rewards to be computed
         for sample in tqdm(
             samples,
