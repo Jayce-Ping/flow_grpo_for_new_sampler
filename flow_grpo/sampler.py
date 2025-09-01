@@ -78,13 +78,12 @@ class DistributedKRepeatSampler(Sampler):
         self.epoch = epoch  # Used to synchronize random state across epochs
 
 
-
 if __name__ == "__main__":
     # This is a simple test for basic functionality.
     num_processes = 4 # 3
-    train_batch_size = 4 # 5
-    num_image_per_prompt = 13 # 2
-    unique_sample_per_epoch = 1 # 13
+    train_batch_size = 1 # 5
+    num_image_per_prompt = 16 # 2
+    unique_sample_per_epoch = 30 # 13
     sample_num_per_batch = num_processes * train_batch_size
     sample_num_per_epoch = math.lcm(num_image_per_prompt * unique_sample_per_epoch, sample_num_per_batch)
     num_batches_per_epoch = int(sample_num_per_epoch // sample_num_per_batch)
@@ -125,10 +124,11 @@ if __name__ == "__main__":
 
     train_iters = [iter(loader) for loader in train_dataloaders]
 
-
-    all_samples = []
-    epoch_num = 3
+    # No bug here, for non-dist env.
+    epoch_num = 100
+    error_epoch = []
     for epoch in range(epoch_num):
+        all_samples = []
         for j, sampler in enumerate(train_samplers):
             sampler.set_epoch(epoch)
             loader_iter = train_iters[j]
@@ -136,9 +136,16 @@ if __name__ == "__main__":
                 samples = next(loader_iter)
                 all_samples.extend(samples[0])
 
-    # for k,v in sorted(counter.items(), key=lambda item: item[0]):
-    #     short_k = k[:10] if len(k) > 10 else k
-    #     print(f"{short_k:>12}:{v:<6}")
-    counter = Counter(all_samples)
-    print(f"\nTotal unique samples: {len(counter)} / {unique_sample_per_epoch * epoch_num}")
-    print(f"Sample length {Counter(list(counter.values()))}")
+        # for k,v in sorted(counter.items(), key=lambda item: item[0]):
+        #     short_k = k[:10] if len(k) > 10 else k
+        #     print(f"{short_k:>12}:{v:<6}")
+        counter = Counter(all_samples)
+        all_unique_group_size = set(Counter(list(counter.values())).values())
+        # print(f"\nTotal unique samples: {len(counter)}")
+        # print(f"Sample length: {Counter(list(counter.values()))}")
+        # print(f"All Unique group sizes: {all_unique_group_size}")
+        if len(all_unique_group_size) > 1:
+            error_epoch.append((epoch, all_unique_group_size))
+
+    
+    print(error_epoch)

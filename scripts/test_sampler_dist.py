@@ -1,9 +1,10 @@
 # This is a test script for the distributed K-repeat sampler, simplified from train_flux.py with only dataloading and gathering parts.
-
+import time
 import argparse
 import hashlib
 import math
 from collections import Counter
+from itertools import groupby
 from accelerate.utils import set_seed
 
 import torch
@@ -63,22 +64,30 @@ def main():
     )
     accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.batch_size
 
-    train_dataloader = accelerator.prepare(train_dataloader)
+    # It will cause misalignment if we use accelerator to prepare dataloader???
+    # Maybe our DistSampler and accelerator's preparation make something duplicate for distribution preparations.
+    # train_dataloader = accelerator.prepare(train_dataloader) 
 
     if accelerator.is_main_process:
         print(f"[world_size={accelerator.num_processes}] "
               f"dataset={len(train_dataset)} k={train_sampler.k} m_final={train_sampler.m} "
               f"num_batches_per_epoch={num_batches_per_epoch} bs={args.batch_size}")
 
-    error_epoch = {}
+
+    it = iter(train_dataloader) # The position of this assignment seems not the real cause
+    epoch_criterion = {}
     # 4) Distributed testing: count unique prompt per epoch from all processes
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        it = iter(train_dataloader)
 
         local_counter = Counter()
         global_counter = Counter() if accelerator.is_main_process else None
 
+        # if accelerator.is_main_process:
+            # Sleep for 3 seconds to simulate async data loading
+            # time.sleep(3)
+
+        all_tensors = []
         for _ in range(num_batches_per_epoch):
             prompts, prompt_metadata = next(it)  # prompts: List[str]
 
@@ -87,10 +96,13 @@ def main():
             local_counter.update(local_hashes)
 
             h = torch.tensor(local_hashes, dtype=torch.long, device=accelerator.device)
-            gathered = accelerator.gather(h).cpu().tolist()
+            all_tensors.append(h)
+        
+        all_tensors = torch.cat(all_tensors, dim=0)
+        gathered = accelerator.gather(all_tensors).cpu().tolist()
 
-            if accelerator.is_main_process:
-                global_counter.update(gathered)
+        if accelerator.is_main_process:
+            global_counter.update(gathered)
 
         # 5) Print statistics
         local_unique = len(local_counter.keys())
@@ -100,15 +112,24 @@ def main():
             global_total = sum(global_counter.values())
             # Expected: global_unique == train_sampler.m; global_total == k*m
             # Record if unexpected case:
-            if global_unique != train_sampler.m or global_total != train_sampler.k * train_sampler.m:
-                error_epoch[epoch] = (global_unique, global_total)
-            print(
-                f"Epoch {epoch} | "
-                f"global_unique={global_unique} (expected {train_sampler.m}) | "
-                f"global_total={global_total} (expected {train_sampler.k * train_sampler.m}) | "
-                f"local_unique(proc0)={local_unique} local_total(proc0)={local_total}"
-                "\n"
-            )
+            criterion = {
+                "global_unique error": global_unique != train_sampler.m,
+                "global_total error": global_total != train_sampler.k * train_sampler.m,
+                "group_size error": not all(v == args.k for v in global_counter.values())
+            }
+            epoch_criterion[epoch] = criterion
+
+            if False:
+                # Print detailed info for each epoch
+                print(
+                    f"Epoch {epoch} | "
+                    f"global_unique={global_unique} (expected {train_sampler.m}) | "
+                    f"global_total={global_total} (expected {train_sampler.k * train_sampler.m}) | "
+                    f"local_unique(proc0)={local_unique} local_total(proc0)={local_total} | "
+                    f"All group has size of {args.k} :({all(v==args.k for v in global_counter.values())}) | "
+                    f"All group sizes (expected all={args.k}): {list(global_counter.values())}"
+                    "\n"
+                )
         else:
             pass
             # Print local statistics for other processes (optional) - maybe will mess up the screen
@@ -116,11 +137,14 @@ def main():
 
     if accelerator.is_main_process:
         print("Done.")
-        if len(error_epoch) > 0:
-            for k, v in error_epoch.items():
-                print(f"  Error at epoch {k}: global_unique={v[0]} global_total={v[1]}")
-        else:
-            print("No errors found.")
+        group_by_error = groupby(epoch_criterion.items(), lambda x: tuple(x[1].values()))
+        for error_boolean, group in group_by_error:
+            epoches = [epoch for epoch, _ in group]
+            if any(error_boolean):
+                e = ", ".join(k for k, v in zip(epoch_criterion[0].keys(), error_boolean) if v)
+                print(f"{e} with {len(epoches)} epoches: {epoches}")
+            else:
+                print(f"No error for {len(epoches)} epoches: {epoches}")
 
 
 

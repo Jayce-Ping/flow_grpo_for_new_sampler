@@ -516,7 +516,7 @@ def main(_):
         eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
     
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    transformer, optimizer, test_dataloader = accelerator.prepare(transformer, optimizer, test_dataloader)
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
     executor = futures.ThreadPoolExecutor(max_workers=8)

@@ -588,7 +588,7 @@ def main(_):
     # autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    transformer, optimizer, test_dataloader = accelerator.prepare(transformer, optimizer, test_dataloader)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.

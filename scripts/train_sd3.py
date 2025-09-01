@@ -519,8 +519,8 @@ def main(_):
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
 
-    # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    # Prepare everything with our `accelerator`. Except train_dataloader, since it is programmed as Distributed class.
+    transformer, optimizer, test_dataloader = accelerator.prepare(transformer, optimizer, test_dataloader)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
