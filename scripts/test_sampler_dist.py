@@ -76,6 +76,7 @@ def main():
 
     it = iter(train_dataloader) # The position of this assignment seems not the real cause
     epoch_criterion = {}
+    all_group_size = set()
     # 4) Distributed testing: count unique prompt per epoch from all processes
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
@@ -118,6 +119,7 @@ def main():
                 "group_size error": not all(v == args.k for v in global_counter.values())
             }
             epoch_criterion[epoch] = criterion
+            all_group_size.update(set(global_counter.values()))
 
             if False:
                 # Print detailed info for each epoch
@@ -144,7 +146,9 @@ def main():
                 e = ", ".join(k for k, v in zip(epoch_criterion[0].keys(), error_boolean) if v)
                 print(f"{e} with {len(epoches)} epoches: {epoches}")
             else:
-                print(f"No error for {len(epoches)} epoches: {epoches}")
+                print(f"No error for {len(epoches)} epoches: {epoches}.")
+
+        print(f"[all_group_size = {all_group_size}.]")
 
 
 
