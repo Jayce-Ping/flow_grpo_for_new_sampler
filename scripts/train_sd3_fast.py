@@ -166,6 +166,16 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     
     return zero_std_ratio, prompt_std_devs.mean()
 
+def create_generator(prompts, base_seed):
+    generators = []
+    for prompt in prompts:
+        # Use a stable hash (SHA256), then convert it to an integer seed
+        hash_digest = hashlib.sha256(prompt.encode()).digest()
+        prompt_hash_int = int.from_bytes(hash_digest[:4], 'big')  # Take the first 4 bytes as part of the seed
+        seed = (base_seed + prompt_hash_int) % (2**31) # Ensure the number is within a valid range
+        gen = torch.Generator().manual_seed(seed)
+        generators.append(gen)
+    return generators
 
         
 def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
@@ -200,6 +210,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
         sample["latents"][:, j].float(),
         prev_sample=sample["next_latents"][:, j].float(),
         noise_level=config.sample.noise_level,
+        sde_type=config.sample.sde_type,
     )
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
@@ -241,14 +252,13 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     negative_prompt_embeds=sample_neg_prompt_embeds,
                     negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
                     num_inference_steps=config.sample.eval_num_steps,
-                    guidance_scale=config.sample.guidance_scale,
+                    guidance_scale=config.sample.eval_guidance_scale,
                     output_type="pt",
                     height=config.resolution,
                     width=config.resolution, 
                     noise_level=0,
-                    mini_num_image_per_prompt=1,
-                    process_index=accelerator.process_index,
-                    sample_num_steps=config.sample.num_steps,
+                    sde_window_size=0,
+                    sde_type=config.sample.sde_type,
                 )
         rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         # yield to to make sure reward computation starts
@@ -335,7 +345,10 @@ def main(_):
         config.run_name += "_" + unique_id
 
     # number of timesteps within each trajectory to train on
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
+    if config.sample.sde_window_size > 0:
+        num_train_timesteps = config.sample.sde_window_size
+    else:
+        num_train_timesteps = config.sample.num_steps - 1
 
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
@@ -350,7 +363,7 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * config.sample.train_num_steps,
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
     )
     if accelerator.is_main_process:
         wandb.init(
@@ -475,7 +488,7 @@ def main(_):
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
-            k=config.sample.num_image_per_prompt//config.sample.mini_num_image_per_prompt,
+            k=config.sample.num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -506,7 +519,7 @@ def main(_):
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
-            k=config.sample.num_image_per_prompt//config.sample.mini_num_image_per_prompt,
+            k=config.sample.num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -533,9 +546,9 @@ def main(_):
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
-    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size*config.sample.mini_num_image_per_prompt, 1, 1)
+    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
-    train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size*config.sample.mini_num_image_per_prompt, 1)
+    train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -627,6 +640,10 @@ def main(_):
             ).input_ids.to(accelerator.device)
 
             # sample
+            if config.sample.same_latent:
+                generator = create_generator(prompts, base_seed=epoch*10000+i)
+            else:
+                generator = None
             with autocast():
                 with torch.no_grad():
                     images, latents, log_probs, timesteps = pipeline_with_logprob(
@@ -641,29 +658,27 @@ def main(_):
                         height=config.resolution,
                         width=config.resolution, 
                         noise_level=config.sample.noise_level,
-                        mini_num_image_per_prompt=config.sample.mini_num_image_per_prompt,
-                        train_num_steps=config.sample.train_num_steps,
-                        process_index=accelerator.process_index,
-                        sample_num_steps=config.sample.num_steps,
-                    )
+                        generator=generator,
+                        sde_window_size=config.sample.sde_window_size,
+                        sde_window_range=config.sample.sde_window_range,
+                        sde_type=config.sample.sde_type,
+                )
 
             latents = torch.stack(
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 16, 96, 96)
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
-            timesteps = torch.stack(timesteps, dim=1)  # shape after stack (batch_size, num_steps)
+            timesteps = torch.stack(timesteps).unsqueeze(0).repeat(config.sample.train_batch_size, 1)  # shape after stack (batch_size, num_steps)
             # compute rewards asynchronously
-            prompts = pipeline.tokenizer.batch_decode(
-                prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1), skip_special_tokens=True
-            )
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             # yield to to make sure reward computation starts
             time.sleep(0)
+
             samples.append(
                 {
-                    "prompt_ids": prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1),
-                    "prompt_embeds": prompt_embeds.repeat(config.sample.mini_num_image_per_prompt,1,1),
-                    "pooled_prompt_embeds": pooled_prompt_embeds.repeat(config.sample.mini_num_image_per_prompt,1),
+                    "prompt_ids": prompt_ids,
+                    "prompt_embeds": prompt_embeds,
+                    "pooled_prompt_embeds": pooled_prompt_embeds,
                     "timesteps": timesteps,
                     "latents": latents[
                         :, :-1
@@ -732,7 +747,7 @@ def main(_):
                 )
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
-        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, config.sample.train_num_steps)
+        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
@@ -788,11 +803,35 @@ def main(_):
         del samples["rewards"]
         del samples["prompt_ids"]
 
+        # Get the mask for samples where all advantages are zero across the time dimension
+        mask = (samples["advantages"].abs().sum(dim=1) != 0)
+        
+        # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
+        # randomly change some False values to True to make it divisible
+        num_batches = config.sample.num_batches_per_epoch
+        true_count = mask.sum()
+        if true_count % num_batches != 0 or true_count == 0:
+            false_indices = torch.where(~mask)[0]
+            num_to_change = num_batches - (true_count % num_batches)
+            if len(false_indices) >= num_to_change:
+                random_indices = torch.randperm(len(false_indices))[:num_to_change]
+                mask[false_indices[random_indices]] = True
+        if accelerator.is_main_process:
+            wandb.log(
+                {
+                    "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
+                },
+                step=global_step,
+            )
+        # Filter out samples where the entire time dimension of advantages is zero
+        samples = {k: v[mask] for k, v in samples.items()}
+
         total_batch_size, num_timesteps = samples["timesteps"].shape
         # assert (
         #     total_batch_size
         #     == config.sample.train_batch_size * config.sample.num_batches_per_epoch
         # )
+
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # rebatch for training
@@ -827,8 +866,9 @@ def main(_):
                     embeds = sample["prompt_embeds"]
                     pooled_embeds = sample["pooled_prompt_embeds"]
 
+                train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
                 for j in tqdm(
-                    range(config.sample.train_num_steps),
+                    train_timesteps,
                     desc="Timestep",
                     position=1,
                     leave=False,

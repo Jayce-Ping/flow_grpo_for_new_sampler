@@ -8,6 +8,27 @@
 </div>
 
 ## Changelog
+<details open>
+
+<summary><strong>2025-11-04</strong></summary>
+
+* Adding **GRPO-Guard** 🔥🔥.
+
+</details>
+
+<details>
+<summary><strong>Update History</strong></summary>
+
+**2025-11-04**
+* Adding support for [Bagel-7B](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT).
+
+**2025-10-14**
+
+* Refactor FlowGRPO-Fast for compatibility with FlowGRPO, add CPS sampling and No-CFG training on SD3.
+
+**2025-08-15**
+
+* Adding support for **Qwen-Image** and **Qwen-Image-Edit**.
 
 **2025-08-15**
 
@@ -40,15 +61,73 @@ accelerate launch --config_file scripts/accelerate_configs/multi_gpu.yaml --num_
 
 - 🔥We showcase image examples from three tasks and their training evolution at https://gongyeliu.github.io/Flow-GRPO. Check them out!
 - 🔥We now provide an online demo for all three tasks at https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO. You're welcome to try it out!
+</details>
 
-## FAQ
+## 🤗 Model
+| Task    | Model |
+| -------- | -------- |
+| GenEval     | [🤗GenEval](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-GenEval) |
+| Text Rendering     | [🤗Text](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-Text) |
+| Human Preference Alignment     | [🤗PickScore](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-PickScore) |
 
-* Please use **fp16** for training whenever possible, as it provides higher precision than bf16, resulting in smaller log-probability errors between data collection and training. For Flux and Wan, becauase fp16 inference cannot produce valid images or videos, you will have to use **bf16** for training. Note that log-probability errors tend to be smaller at high-noise steps and larger at low-noise steps. Training only on high-noise steps yields better results in this case. Thanks to [Jing Wang](https://scholar.google.com.hk/citations?user=Q9Np_KQAAAAJ&hl=zh-CN) for these observations.
+## Training Speed
 
-* When using **Flow-GRPO-Fast**, set a relatively small `clip_range`, otherwise training may crash.
+To improve training efficiency, we provide a better set of parameters for Flow-GRPO.
+We found the following adjustments significantly accelerate training:
 
-* When implementing a new model, please check whether using different batch sizes leads to slight differences in the output. SD3 has this issue, which is why I ensure that the batch size for training is the same as that used for data collection.
+* No CFG during training or testing — the RL process effectively performs **CFG distillation**.
+* Use the window mechanism from **Flow-GRPO-Fast** or **[MixGRPO](https://www.arxiv.org/abs/2507.21802)** — only train on partial steps.
+* Adopt **[Coefficients-Preserving Sampling](https://arxiv.org/abs/2509.05952) (CPS)** — CPS provides a notable improvement on GenEval, and produces higher-quality samples. A typical setting is `noise_level = 0.8`, which works well without tuning for different models or step counts.
 
+The figure below shows the test-set performance curves using GenEval and PickScore as rewards, where both training and evaluation are performed **without CFG**. The experiments are configured with [**geneval_sd3_fast_nocfg**](https://github.com/yifan123/flow_grpo/blob/main/config/grpo.py#L163) and [**pickscore_sd3_fast_nocfg**](https://github.com/yifan123/flow_grpo/blob/main/config/grpo.py#L323), using scripts from `scripts/multi_node/sd3_fast`.
+
+<p align="center">
+  <img src="flow_grpo/assets/flow_grpo_fast_nocfg_geneval.svg" alt="Flow-GRPO-Fast Illustration" width="350"/>
+  <img src="flow_grpo/assets/flow_grpo_fast_nocfg_pickscore.svg" alt="Flow-GRPO-Fast Illustration" width="350"/> 
+</p>
+
+## 🛡️ Over-optimization (GRPO-Guard) 🔥🔥
+
+To mitigates implicit over-optimization in flow matching, our team propose [GRPO-Guard](https://arxiv.org/abs/2510.22319) ( [🔥Project Page](https://jingw193.github.io/GRPO-Guard/)).
+
+We first observe that the importance ratio exhibits an inherent bias:
+
+1. Its mean is consistently **below 1** and becomes significantly pronounced at low-noise steps (e.g., step 8 in SD3.5-M).
+
+2. The variance varies notably across different steps.
+
+Ideally, the importance ratio distribution should have a mean of 1 and stable variance. The clipping operation truncates overly confident positive or negative samples outside the region [1−ϵ,1+ϵ], ensuring stable gradient updates. However, the observed bias in the importance ratio disrupts this mechanism—gradients of positive samples are no longer properly constrained, **leading the policy model into over-optimization**. As a result, the proxy score continues to rise while the gold score declines, causing a severe degradation in image quality.
+
+
+The biased ratio distributions are summarized in the table below.
+
+| FlowGRPO | GRPO-Guard|
+| - | - |
+| ![flow_grpo ratio](flow_grpo/assets/GRPO-Guard/gif_1.gif) | ![grpo_guard ratio](flow_grpo/assets/GRPO-Guard/gif_2.gif)  |
+| The clipping mechanism is imbalanced, failing to constrain overconfident positive samples. | The clipping mechanism is imbalanced, failing to constrain overconfident positive samples.|
+
+
+To address this issue, [GRPO-Guard](https://arxiv.org/abs/2510.22319) introduces two mechanisms that effectively alleviate over-optimization:
+
+- **RatioNorm**: Corrects the distributional bias of importance ratios and unifies their statistics across denoising steps.
+
+- **Gradient Reweight**: Further reweights the gradients of different denoising steps based on RatioNorm, balancing their contributions and preventing excessive optimization under specific noise levels.
+
+The following figure compares over-optimization between GRPO-Guard and FlowGRPO on text rendering tasks. GRPO-Guard maintains the same rising trend in proxy scores as FlowGRPO while preventing rapid declines in gold scores, thus preserving high image quality and diversity.
+
+<p align="center">
+  <img src="flow_grpo/assets/GRPO-Guard/GRPO-Guard-figure1.png" alt="GRPO-Guard Illustration" width=900"/>
+</p>
+
+**Start Training**
+
+After downloading the base model and setting up the reward model, run the following script to start training the GRPO-Guard for the SD3.5-M text rendering task.
+```bash
+# Master node
+bash scripts/multi_node/sd3_grpo_guard.sh 0
+# Other nodes
+bash scripts/multi_node/sd3_grpo_guard.sh 1
+```
 
 ## Flow-GRPO-Fast
 We propose Flow-GRPO-Fast, an accelerated variant of Flow-GRPO that requires training on **only one or two denoising step** per trajectory. For each prompt, we first generate a deterministic trajectory using ODE sampling. At a randomly chosen intermediate step, we inject noise and switch to SDE sampling to generate a group. The rest of the process continues with ODE sampling. This confines stochasticity to one or two steps, allowing training to focus solely on that steps. This few-step training idea was primarily proposed by [Ziyang Yuan](https://scholar.google.com/citations?user=fWxWEzsAAAAJ&hl=en) during our discussions in early June. 
@@ -67,13 +146,6 @@ Experiments on PickScore show that Flow-GRPO-Fast matches the reward performance
 
 
 Please use scripts in `scripts/multi_node/sd3_fast` to run these experiments.
-
-## 🤗 Model
-| Task    | Model |
-| -------- | -------- |
-| GenEval     | [🤗GenEval](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-GenEval) |
-| Text Rendering     | [🤗Text](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-Text) |
-| Human Preference Alignment     | [🤗PickScore](https://huggingface.co/jieliu/SD3.5M-FlowGRPO-PickScore) |
 
 
 ## 🚀 Quick Started
@@ -121,7 +193,7 @@ ocr = PaddleOCR(use_angle_cls=False, lang="en", use_gpu=False, show_log=False)
 ```
 
 #### Pickscore
-PickScore requires no additional installation.
+PickScore requires no additional installation. Note that the original [pickscore](https://huggingface.co/datasets/yuvalkirstain/pickapic_v1) dataset corresponds to `dataset/pickscore` in this repository, containing some NSFW prompts. We strongly recommend using [pickapic\_v1\_no\_images\_training\_sfw](https://huggingface.co/datasets/CarperAI/pickapic_v1_no_images_training_sfw), the SFW version of the Pick-a-Pic dataset, which corresponds to `dataset/pickscore_sfw` in this repository.
 
 #### DeQA
 Please create a new Conda virtual environment and install the corresponding dependencies according to the instructions in [reward-server](https://github.com/yifan123/reward-server).
@@ -145,42 +217,52 @@ pip install git+https://github.com/openai/CLIP.git
 ```
 
 ### 4. Start Training
-If the GPU memory is insufficient, you can use DeepSpeed Zero2 or Zero3.
-
-```bash
-# zero2
-accelerate launch --config_file scripts/accelerate_configs/deepspeed_zero2.yaml
-# zero3
-accelerate launch --config_file scripts/accelerate_configs/deepspeed_zero3.yaml
-```
 
 #### GRPO
-Single-node training:
+
+
+**Single-node training**
+
 ```bash
 # sd3
 bash scripts/single_node/grpo.sh
 # flux
 bash scripts/single_node/grpo_flux.sh
 ```
-Multi-node training for SD3:
+
+---
+
+<details> <summary>Multi-node training for SD3:</summary>
+
 ```bash
 # Master node
-bash scripts/multi_node/sd3/main.sh
+bash scripts/multi_node/sd3.sh 0
 # Other nodes
-bash scripts/multi_node/sd3/main1.sh
-bash scripts/multi_node/sd3/main2.sh
-bash scripts/multi_node/sd3/main3.sh
+bash scripts/multi_node/sd3.sh 1
+bash scripts/multi_node/sd3.sh 2
+bash scripts/multi_node/sd3.sh 3
 ```
-Multi-node training for FLUX.1-dev:
+---
+</details>
+
+
+<details> <summary>Multi-node training for FLUX.1-dev</summary>
+
 ```bash
 # Master node
-bash scripts/multi_node/flux/main.sh
-# Other nodes
-bash scripts/multi_node/flux/main1.sh
-bash scripts/multi_node/flux/main2.sh
-bash scripts/multi_node/flux/main3.sh
+bash scripts/multi_node/flux.sh 0
+# Other node
+bash scripts/multi_node/flux.sh 1
+bash scripts/multi_node/flux.sh 2
+bash scripts/multi_node/flux.sh 3
 ```
-Multi-node training for FLUX.1-Kontext-dev:
+For Flow-GRPO-Fast, please use `scripts/multi_node/flux_fast.sh`. See the W&B logs for [Geneval](https://api.wandb.ai/links/ljie/qz47q208) (with `geneval_flux_fast` in the config) and [PickScore](https://api.wandb.ai/links/ljie/ncdwa0wo) (with `pickscore_flux_fast` in the config).
+
+---
+</details>
+
+
+<details> <summary>Multi-node training for FLUX.1-Kontext-dev</summary>
 
 Please first download [generated\_images.zip](https://huggingface.co/datasets/jieliu/counting_edit/blob/main/generated_images.zip) and extract it into the `counting_edit` directory. You can also use the scripts in the `counting_edit` directory to generate the data yourself.
 
@@ -192,12 +274,102 @@ After upgrading Diffusers, some packages such as PEFT may also need to be upgrad
 Then, run the scripts:
 ```bash
 # Master node
-bash scripts/multi_node/flux_kontext/main.sh
+bash scripts/multi_node/flux_kontext.sh 0
 # Other nodes
-bash scripts/multi_node/flux_kontext/main1.sh
-bash scripts/multi_node/flux_kontext/main2.sh
-bash scripts/multi_node/flux_kontext/main3.sh
+bash scripts/multi_node/flux_kontext.sh 1
+bash scripts/multi_node/flux_kontext.sh 2
+bash scripts/multi_node/flux_kontext.sh 3
 ```
+---
+</details>
+
+
+<details> <summary>Multi-node training for Qwen-Image:</summary>
+
+In the implementation of Qwen-Image, we have unified Flow-GRPO and Flow-GRPO-Fast. You can control the size of the SDE window with `config.sample.sde_window_size`, and adjust the position of the window with `config.sample.sde_window_range`.
+
+Please install `diffusers` from the main branch to support `Qwen-Image`:
+```bash
+pip install git+https://github.com/huggingface/diffusers.git
+```
+Then run the scripts:
+```bash
+# Master node
+bash scripts/multi_node/qwenimage.sh 0
+# Other nodes
+bash scripts/multi_node/qwenimage.sh 1
+bash scripts/multi_node/qwenimage.sh 2
+bash scripts/multi_node/qwenimage.sh 3
+```
+Using the provided configuration, the resulting reward curve of Qwen-Image on the test set is shown below.
+
+<p align="center">
+  <img src="flow_grpo/assets/flow_grpo_fast_qwenimage.png" alt="Flow-GRPO-Fast Illustration" width=350"/>
+</p>
+---
+</details>
+
+
+<details> <summary>Multi-node training for Qwen-Image-Edit:</summary>
+
+Same as Flux Kontext, please first download [generated\_images.zip](https://huggingface.co/datasets/jieliu/counting_edit/blob/main/generated_images.zip) and extract it into the `counting_edit` directory. You can also use the scripts in the `counting_edit` directory to generate the data yourself.
+
+Please install `diffusers` from the main branch to support `Qwen-Image-Edit`:
+```bash
+pip install git+https://github.com/huggingface/diffusers.git
+```
+Then run the scripts:
+```bash
+# Master node
+bash scripts/multi_node/qwenimage_edit.sh 0
+# Other nodes
+bash scripts/multi_node/qwenimage_edit.sh 1
+bash scripts/multi_node/qwenimage_edit.sh 2
+bash scripts/multi_node/qwenimage_edit.sh 3
+```
+
+Using the provided configuration, the resulting reward curve of Qwen-Image-Edit on the test set is shown below.
+
+<p align="center">
+  <img src="flow_grpo/assets/qwenimageedit_epoch.png" alt="Flow-GRPO-Fast Illustration" width="350"/>
+  <img src="flow_grpo/assets/qwenimageedit_time.png" alt="Flow-GRPO-Fast Illustration" width="350"/> 
+</p>
+---
+</details>
+
+
+<details> <summary>Multi-node training for Bagel:</summary>
+
+Please first upgrade `transformers` to **version>=4.44.0** install `flash-attn`:
+```bash
+pip install transformers==4.44.0
+pip install flash-attn==2.7.4.post1 --no-build-isolation
+```
+
+Then run the scripts:
+```bash
+# Master node
+bash scripts/multi_node/bagel/main.sh 0
+# Other nodes
+bash scripts/multi_node/bagel/main.sh 1
+bash scripts/multi_node/bagel/main.sh 2
+bash scripts/multi_node/bagel/main.sh 3
+```
+
+Using the provided configuration, the resulting reward(PickScore) curve of Bagel on the test set is shown below (with 32 GPU).
+
+<p align="center">
+  <img src="flow_grpo/assets/bagel_pickscore.svg" alt="Flow-GRPO-Fast Illustration" width="350"/>
+</p>
+
+**[Note]: About resource requirements & OOM**
+
+The default training script adopts full-parameter mode, whcih requires at least **8 × 80GB GPUs**. If you encounter OOM issues, you can switch to LoRA training with the config provided in `config/grpo.py:pickscore_bagel_lora`.
+
+---
+</details>
+
+
 #### DPO / OnlineDPO / SFT / OnlineSFT
  Single-node training:
 ```bash
@@ -207,6 +379,16 @@ bash scripts/single_node/sft.sh
 Multi-node training:
 
 Please update the entry Python script and config file names in the `scripts/multi_node` bash file.
+
+
+## FAQ
+
+* Please use **fp16** for training whenever possible, as it provides higher precision than bf16, resulting in smaller log-probability errors between data collection and training. For Flux and Wan, becauase fp16 inference cannot produce valid images or videos, you will have to use **bf16** for training. Note that log-probability errors tend to be smaller at high-noise steps and larger at low-noise steps. Training only on high-noise steps yields better results in this case. Thanks to [Jing Wang](https://scholar.google.com.hk/citations?user=Q9Np_KQAAAAJ&hl=zh-CN) for these observations.
+
+* When using **Flow-GRPO-Fast**, set a relatively small `clip_range`, otherwise training may crash.
+
+* When implementing a new model, please check whether using different batch sizes leads to slight differences in the output. SD3 has this issue, which is why I ensure that the batch size for training is the same as that used for data collection.
+
 
 ## How to Support Other Models
 
@@ -275,6 +457,18 @@ If you find Flow-GRPO useful for your research or projects, we would greatly app
   author={Liu, Jie and Liu, Gongye and Liang, Jiajun and Li, Yangguang and Liu, Jiaheng and Wang, Xintao and Wan, Pengfei and Zhang, Di and Ouyang, Wanli},
   journal={arXiv preprint arXiv:2505.05470},
   year={2025}
+}
+```
+If you find GRPO-Guard useful for your research or projects, we would greatly appreciate it if you could cite the following paper:
+```
+@misc{wang2025grpoguardmitigatingimplicitoveroptimization,
+    title={GRPO-Guard: Mitigating Implicit Over-Optimization in Flow Matching via Regulated Clipping}, 
+    author={Jing Wang and Jiajun Liang and Jie Liu and Henglin Liu and Gongye Liu and Jun Zheng and Wanyuan Pang and Ao Ma and Zhenyu Xie and Xintao Wang and Meng Wang and Pengfei Wan and Xiaodan Liang},
+    year={2025},
+    eprint={2510.22319},
+    archivePrefix={arXiv},
+    primaryClass={cs.CV},
+    url={https://arxiv.org/abs/2510.22319}, 
 }
 ```
 If you find Flow-DPO useful for your research or projects, we would greatly appreciate it if you could cite the following paper:

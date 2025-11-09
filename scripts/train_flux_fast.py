@@ -22,8 +22,7 @@ import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.sampler import DistributedKRepeatSampler
-from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.diffusers_patch.flux_pipeline_with_logprob_fast import pipeline_with_logprob
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
 import torch
@@ -80,6 +79,50 @@ class GenevalPromptDataset(Dataset):
         prompts = [example["prompt"] for example in examples]
         metadatas = [example["metadata"] for example in examples]
         return prompts, metadatas
+
+class DistributedKRepeatSampler(Sampler):
+    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size  # Batch size per replica
+        self.k = k                    # Number of repetitions per sample
+        self.num_replicas = num_replicas  # Total number of replicas
+        self.rank = rank              # Current replica rank
+        self.seed = seed              # Random seed for synchronization
+        
+        # Compute the number of unique samples needed per iteration
+        self.total_samples = self.num_replicas * self.batch_size
+        assert self.total_samples % self.k == 0, f"k can not divide n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
+        self.m = self.total_samples // self.k  # Number of unique samples
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            # Generate a deterministic random sequence to ensure all replicas are synchronized
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            
+            # Randomly select m unique samples
+            indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+            
+            # Repeat each sample k times to generate n*b total samples
+            repeated_indices = [idx for idx in indices for _ in range(self.k)]
+            
+            # Shuffle to ensure uniform distribution
+            shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
+            shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
+            
+            # Split samples to each replica
+            per_card_samples = []
+            for i in range(self.num_replicas):
+                start = i * self.batch_size
+                end = start + self.batch_size
+                per_card_samples.append(shuffled_samples[start:end])
+            
+            # Return current replica's sample indices
+            yield per_card_samples[self.rank]
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch  # Used to synchronize random state across epochs
 
 
 def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_length, device):
@@ -169,6 +212,7 @@ def compute_log_prob(transformer, pipeline, sample, j, config):
         sample["latents"][:, j].float(),
         prev_sample=sample["next_latents"][:, j].float(),
         noise_level=config.sample.noise_level,
+        sde_type=config.sample.sde_type,
     )
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
@@ -195,16 +239,18 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         )
         with autocast():
             with torch.no_grad():
-                images, _, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     num_inference_steps=config.sample.eval_num_steps,
-                    guidance_scale=config.sample.guidance_scale,
+                    guidance_scale=config.sample.eval_guidance_scale,
                     output_type="pt",
                     height=config.resolution,
                     width=config.resolution, 
                     noise_level=0,
+                    sde_window_size=0,
+                    sde_type=config.sample.sde_type,
                 )
         rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         # yield to to make sure reward computation starts
@@ -290,8 +336,10 @@ def main(_):
     else:
         config.run_name += "_" + unique_id
 
-    # number of timesteps within each trajectory to train on
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
+    if config.sample.sde_window_size > 0:
+        num_train_timesteps = config.sample.sde_window_size
+    else:
+        num_train_timesteps = config.sample.num_steps - 1
 
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
@@ -318,6 +366,7 @@ def main(_):
         #     config=config.to_dict(),
         #     init_kwargs={"wandb": {"name": config.run_name}},
         # )
+    logger.info(f"\n{config}")
 
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
@@ -431,7 +480,6 @@ def main(_):
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
             k=config.sample.num_image_per_prompt,
-            m=config.sample.unique_prompt_per_epoch,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -463,7 +511,6 @@ def main(_):
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
             k=config.sample.num_image_per_prompt,
-            m=config.sample.unique_prompt_per_epoch,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -485,10 +532,6 @@ def main(_):
         )
     else:
         raise NotImplementedError("Only general_ocr is supported with dataset")
-
-    if config.sample.unique_prompt_per_epoch != train_sampler.m:
-        logger.info(f"For sampling balance, `config.sample.unique_prompt_per_epoch` changed from {config.sample.unique_prompt_per_epoch} to {train_sampler.m}!")
-        config.sample.unique_prompt_per_epoch = train_sampler.m
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -516,7 +559,7 @@ def main(_):
         eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
     
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, test_dataloader = accelerator.prepare(transformer, optimizer, test_dataloader)
+    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
     executor = futures.ThreadPoolExecutor(max_workers=8)
@@ -532,8 +575,6 @@ def main(_):
         * accelerator.num_processes
         * config.train.gradient_accumulation_steps
     )
-    # Move `config` log here, after all potential changes
-    logger.info(f"\n{config}")
 
     logger.info("***** Running training *****")
     logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
@@ -556,6 +597,7 @@ def main(_):
 
     epoch = 0
     global_step = 0
+    train_iter = iter(train_dataloader)
 
     while True:
         #################### EVAL ####################
@@ -567,16 +609,15 @@ def main(_):
 
         #################### SAMPLING ####################
         pipeline.transformer.eval()
-        train_sampler.set_epoch(epoch)
-        train_iter = iter(train_dataloader)
         samples = []
         prompts = []
         for i in tqdm(
-            range(train_sampler.num_batches_per_epoch),
+            range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
+            train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
             prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
@@ -601,7 +642,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, image_ids, text_ids, log_probs = pipeline_with_logprob(
+                    images, latents, image_ids, text_ids, log_probs, timesteps = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -611,15 +652,16 @@ def main(_):
                         height=config.resolution,
                         width=config.resolution, 
                         noise_level=config.sample.noise_level,
-                        generator=generator
+                        generator=generator,
+                        sde_window_size=config.sample.sde_window_size,
+                        sde_window_range=config.sample.sde_window_range,
+                        sde_type=config.sample.sde_type,
                 )
 
             latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, 16, 96, 96)
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
 
-            timesteps = pipeline.scheduler.timesteps.repeat(
-                config.sample.train_batch_size, 1
-            )  # (batch_size, num_steps)
+            timesteps = torch.stack(timesteps).unsqueeze(0).repeat(config.sample.train_batch_size, 1)  # shape after stack (batch_size, num_steps)
 
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
@@ -758,14 +800,8 @@ def main(_):
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
 
-        assert num_timesteps == config.sample.num_steps
-
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
-            # shuffle samples along batch dimension
-            perm = torch.randperm(total_batch_size, device=accelerator.device)
-            samples = {k: v[perm] for k, v in samples.items()}
-
             # rebatch for training
             samples_batched = {
                 k: v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
