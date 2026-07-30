@@ -462,8 +462,13 @@ def geneval_score(device):
                 all_scores.append(strict)          # GRPO training signal = strict reward
                 all_rewards.append(reward)         # accuracy (lenient), or strict when only_strict
                 all_strict_rewards.append(strict)
-                group_rewards[tag].append(reward)
-                group_strict_rewards[tag].append(strict)
+                if not only_strict:
+                    # Per-tag group rewards are ONLY produced in eval. During training
+                    # (only_strict=True) they are left EMPTY: their per-tag lists have rank-varying
+                    # lengths and would deadlock the training-phase accelerator.gather (which gathers
+                    # every reward key). Matches the "only strict reward is needed in training" intent.
+                    group_rewards[tag].append(reward)
+                    group_strict_rewards[tag].append(strict)
         return all_scores, all_rewards, all_strict_rewards, dict(group_rewards), dict(group_strict_rewards)
 
     return _fn

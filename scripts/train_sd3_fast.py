@@ -215,6 +215,26 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
+def _gather_ragged(accelerator, value):
+    """All-gather a possibly rank-varying-length 1-D sequence of floats -> concatenated np array.
+
+    accelerator.gather requires identical shapes across ranks; the in-env GenEval reward's per-tag
+    group rewards (score_details['{tag}_accuracy']) have DIFFERENT lengths per rank because each
+    rank samples a different tag distribution, which deadlocks a plain gather (NCCL watchdog abort).
+    We pad each rank to the global-max length, gather, then trim each rank back to its real length.
+    Equal-length keys (per-image accuracy/strict/geneval/avg) pass through unchanged.
+    """
+    t = torch.as_tensor(value, device=accelerator.device, dtype=torch.float32).flatten()
+    lengths = accelerator.gather(torch.tensor([t.numel()], device=accelerator.device)).cpu().numpy()
+    maxn = int(lengths.max()) if len(lengths) else 0
+    if maxn == 0:
+        return np.array([], dtype=np.float32)
+    if t.numel() < maxn:
+        t = torch.cat([t, torch.full((maxn - t.numel(),), float("nan"), device=t.device, dtype=t.dtype)])
+    g = accelerator.gather(t).cpu().numpy().reshape(-1, maxn)
+    return np.concatenate([g[i, : int(lengths[i])] for i in range(len(lengths))])
+
+
 def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
@@ -266,7 +286,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         rewards, reward_metadata = rewards.result()
 
         for key, value in rewards.items():
-            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+            rewards_gather = _gather_ragged(accelerator, value)
             all_rewards[key].append(rewards_gather)
     
     last_batch_images_gather = accelerator.gather(torch.as_tensor(images, device=accelerator.device)).cpu().numpy()
@@ -283,7 +303,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
     )
     last_batch_rewards_gather = {}
     for key, value in rewards.items():
-        last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+        last_batch_rewards_gather[key] = _gather_ragged(accelerator, value)
 
     all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
     if accelerator.is_main_process:
