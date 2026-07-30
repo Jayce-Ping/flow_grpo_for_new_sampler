@@ -222,6 +222,10 @@ GENEVAL_COLORS = [
     "red", "orange", "yellow", "green", "blue",
     "purple", "pink", "brown", "black", "white",
 ]
+# Fixed canonical tag set + order (the 6 GenEval categories). Every rank's returned group dict uses
+# these exact keys in this exact order so score_details keys are IDENTICAL across ranks -> the eval
+# per-key accelerator.gather stays in lockstep. (A rank-varying key set desyncs the collectives.)
+GENEVAL_TAGS = ("single_object", "two_object", "counting", "colors", "position", "color_attr")
 GENEVAL_DETECTION_THRESHOLD = 0.3
 GENEVAL_COUNTING_THRESHOLD = 0.9
 GENEVAL_MAX_OBJECTS = 16
@@ -450,8 +454,10 @@ def geneval_score(device):
         del prompts
         pil_images = _geneval_to_pil_list(images)
         all_scores, all_rewards, all_strict_rewards = [], [], []
-        group_rewards = defaultdict(list)
-        group_strict_rewards = defaultdict(list)
+        # Fixed-key ordered group dicts (all GENEVAL_TAGS present, empty ones kept) so every rank
+        # iterates the SAME score_details keys in the SAME order -> collective gathers stay synced.
+        group_rewards = {t: [] for t in GENEVAL_TAGS}
+        group_strict_rewards = {t: [] for t in GENEVAL_TAGS}
         # mmdet's Mask2Former (ms_deform_attn) has no bf16 CUDA kernel and CLIP weights stay
         # fp32; disable AMP for the whole reward pass (matches Flow-Factory / GenEval reference).
         with torch.amp.autocast("cuda", enabled=False):
@@ -462,14 +468,16 @@ def geneval_score(device):
                 all_scores.append(strict)          # GRPO training signal = strict reward
                 all_rewards.append(reward)         # accuracy (lenient), or strict when only_strict
                 all_strict_rewards.append(strict)
-                if not only_strict:
-                    # Per-tag group rewards are ONLY produced in eval. During training
-                    # (only_strict=True) they are left EMPTY: their per-tag lists have rank-varying
-                    # lengths and would deadlock the training-phase accelerator.gather (which gathers
-                    # every reward key). Matches the "only strict reward is needed in training" intent.
+                if not only_strict and tag in group_rewards:
+                    # Per-tag group rewards are produced ONLY in eval (fixed 6-tag key set/order).
                     group_rewards[tag].append(reward)
                     group_strict_rewards[tag].append(strict)
-        return all_scores, all_rewards, all_strict_rewards, dict(group_rewards), dict(group_strict_rewards)
+        if only_strict:
+            # Training: EMPTY group dicts -> no per-tag score_details keys -> the training-phase
+            # gather sees only equal-length per-image keys (no desync / no deadlock). Matches the
+            # "only the strict reward is needed in training" intent.
+            return all_scores, all_rewards, all_strict_rewards, {}, {}
+        return all_scores, all_rewards, all_strict_rewards, group_rewards, group_strict_rewards
 
     return _fn
 
