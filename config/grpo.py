@@ -257,6 +257,15 @@ def geneval_sd3_dpm_nocfg():
     config.save_dir = 'logs/geneval/sd3.5-M-dpm-nocfg'
     return config
 
+def geneval_sd3_sde_nocfg():
+    # Same grid/hyper-params as geneval_sd3_fast_nocfg (CPS); only the stochastic transition changes
+    # to the Flow-GRPO Euler-Maruyama SDE (sde_type="sde"), noise_level=0.7 (Flow-GRPO default).
+    config = geneval_sd3_fast_nocfg()
+    config.sample.sde_type = "sde"
+    config.sample.noise_level = 0.7
+    config.save_dir = 'logs/geneval/sd3.5-M-sde-nocfg'
+    return config
+
 def pickscore_sd3():
     gpu_number=32
     config = compressibility()

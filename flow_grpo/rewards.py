@@ -1,5 +1,6 @@
 from PIL import Image
 import io
+import json
 import numpy as np
 import torch
 from collections import defaultdict
@@ -207,74 +208,263 @@ def deqa_score_remote(device):
 
     return _fn
 
-def geneval_score(device):
-    """Submits images to GenEval and computes a reward.
-    """
-    import requests
-    from requests.adapters import HTTPAdapter, Retry
-    from io import BytesIO
-    import pickle
+# ===========================================================================
+# GenEval reward — IN-ENV (no HTTP reward-server), ported from Flow-Factory's
+# src/flow_factory/rewards/geneval.py: Mask2Former (mmdet 3.x) detection +
+# open_clip ViT-L-14 zero-shot color, evaluating each image against its
+# {tag, include:[{class,count,color?,position?}], exclude?} metadata.
+# Returns the same 5-tuple the reward-server did:
+#   (scores, rewards, strict_rewards, group_rewards, group_strict_rewards)
+# where `scores` = the per-image STRICT reward (the GRPO training signal),
+# `rewards` = the lenient fraction (accuracy logging), grouped by `tag`.
+# ===========================================================================
+GENEVAL_COLORS = [
+    "red", "orange", "yellow", "green", "blue",
+    "purple", "pink", "brown", "black", "white",
+]
+GENEVAL_DETECTION_THRESHOLD = 0.3
+GENEVAL_COUNTING_THRESHOLD = 0.9
+GENEVAL_MAX_OBJECTS = 16
+GENEVAL_DETECTOR_CONFIG = "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco"
+GENEVAL_DETECTOR_CHECKPOINT = (
+    "https://download.openmmlab.com/mmdetection/v3.0/mask2former/"
+    "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco/"
+    "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco_20220504_001756-c9d0c4f2.pth"
+)
+GENEVAL_CLIP_MODEL = "ViT-L-14"
+import os as _os
+from pathlib import Path as _Path
+GENEVAL_OBJECT_NAMES_PATH = str(
+    _Path(__file__).resolve().parents[1] / "dataset" / "geneval" / "object_names.txt"
+)
 
-    batch_size = 64
-    url = "http://127.0.0.1:18085"
-    sess = requests.Session()
-    retries = Retry(
-        total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False
-    )
-    sess.mount("http://", HTTPAdapter(max_retries=retries))
+
+def _geneval_check_position(bbox_a, bbox_b, relation):
+    """True if bbox_b satisfies the spatial `relation` relative to bbox_a."""
+    ca = ((bbox_a[0] + bbox_a[2]) / 2, (bbox_a[1] + bbox_a[3]) / 2)
+    cb = ((bbox_b[0] + bbox_b[2]) / 2, (bbox_b[1] + bbox_b[3]) / 2)
+    if relation == "above":
+        return cb[1] < ca[1]
+    if relation == "below":
+        return cb[1] > ca[1]
+    if relation == "left of":
+        return cb[0] < ca[0]
+    if relation == "right of":
+        return cb[0] > ca[0]
+    return False
+
+
+def _geneval_to_pil_list(images):
+    """Accept a torch NCHW float[0,1] tensor or a numpy array (NHWC/NCHW) -> list[PIL]."""
+    if isinstance(images, torch.Tensor):
+        arr = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        arr = arr.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+    else:
+        arr = np.asarray(images)
+        if arr.ndim == 4 and arr.shape[1] in (1, 3) and arr.shape[-1] not in (1, 3):
+            arr = arr.transpose(0, 2, 3, 1)
+        if arr.dtype != np.uint8:
+            arr = (arr * 255).round().clip(0, 255).astype(np.uint8)
+    return [Image.fromarray(a) for a in arr]
+
+
+class _GenEvalEngine:
+    """In-process GenEval detector + CLIP color classifier (loaded once per device)."""
+
+    def __init__(self, device):
+        import torch.nn.functional as F  # noqa: F401 (used by methods)
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        with open(GENEVAL_OBJECT_NAMES_PATH, "r") as f:
+            self._object_names = [ln.strip() for ln in f if ln.strip()]
+        self._name_to_idx = {n: i for i, n in enumerate(self._object_names)}
+        self._det_thresh = GENEVAL_DETECTION_THRESHOLD
+        self._count_thresh = GENEVAL_COUNTING_THRESHOLD
+        self._max_objects = GENEVAL_MAX_OBJECTS
+        self._init_detector()
+        self._init_clip()
+        self._color_text_features = {}
+
+    # ---- model loading (mirrors Flow-Factory geneval.py) ----
+    def _init_detector(self):
+        try:
+            from mmdet.apis import init_detector, inference_detector
+        except ImportError as e:
+            raise ImportError("mmdet is required for in-env GenEval: pip install mmdet mmengine") from e
+        self._inference_detector = inference_detector
+        cfg = GENEVAL_DETECTOR_CONFIG
+        if not _os.path.exists(cfg) and not cfg.endswith(".py") and "/" not in cfg:
+            resolved = self._resolve_mmdet_short_config(cfg)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"Could not resolve mmdet config '{cfg}'. Ensure mmdet shipped its "
+                    f"bundled model zoo (<mmdet>/.mim/configs/...)."
+                )
+            cfg = resolved
+        self._detector = init_detector(cfg, GENEVAL_DETECTOR_CHECKPOINT, device=str(self.device))
+
+    @staticmethod
+    def _resolve_mmdet_short_config(short_name):
+        import mmdet
+        root0 = _Path(mmdet.__file__).parent
+        for root in (root0 / ".mim" / "configs", root0.parent / "configs"):
+            if root.is_dir():
+                for p in root.rglob(f"{short_name}.py"):
+                    return str(p)
+        return None
+
+    def _init_clip(self):
+        try:
+            import open_clip
+        except ImportError as e:
+            raise ImportError("open_clip_torch is required for in-env GenEval color") from e
+        self._clip_model, _, self._clip_preprocess = open_clip.create_model_and_transforms(
+            GENEVAL_CLIP_MODEL, pretrained="openai", device=str(self.device)
+        )
+        self._clip_tokenizer = open_clip.get_tokenizer(GENEVAL_CLIP_MODEL)
+        self._clip_model.eval()
+
+    # ---- scoring primitives ----
+    @torch.no_grad()
+    def _color_text(self, classname):
+        import torch.nn.functional as F
+        if classname not in self._color_text_features:
+            prompts = [f"a photo of a {c} {classname}" for c in GENEVAL_COLORS]
+            tok = self._clip_tokenizer(prompts).to(self._clip_model.visual.proj.device)
+            feats = F.normalize(self._clip_model.encode_text(tok), dim=-1)
+            self._color_text_features[classname] = feats
+        return self._color_text_features[classname]
+
+    @torch.no_grad()
+    def _classify_color(self, image, bbox, classname):
+        import torch.nn.functional as F
+        x1, y1, x2, y2 = [int(c) for c in bbox]
+        crop = image.crop((x1, y1, x2, y2))
+        if crop.width < 1 or crop.height < 1:
+            return "unknown"
+        dev = self._clip_model.visual.proj.device
+        img = self._clip_preprocess(crop).unsqueeze(0).to(dev)
+        feats = F.normalize(self._clip_model.encode_image(img), dim=-1)
+        sim = (feats @ self._color_text(classname).T).squeeze(0)
+        return GENEVAL_COLORS[int(sim.argmax().item())]
+
+    @torch.no_grad()
+    def _detect(self, image):
+        result = self._inference_detector(self._detector, np.array(image))
+        pred = result.pred_instances
+        bb = pred.bboxes.cpu().numpy()
+        lb = pred.labels.cpu().numpy()
+        sc = pred.scores.cpu().numpy()
+        m = sc >= self._det_thresh
+        return bb[m], lb[m], sc[m]
+
+    @torch.no_grad()
+    def evaluate_one(self, image, metadata, only_strict):
+        """Return (lenient_fraction, strict_reward) for one image vs its metadata."""
+        include = metadata.get("include", []) if isinstance(metadata, dict) else []
+        exclude = metadata.get("exclude", None) if isinstance(metadata, dict) else None
+        if isinstance(include, str):
+            include = json.loads(include)
+        if isinstance(exclude, str):
+            exclude = json.loads(exclude) or None
+        bboxes, labels, scores = self._detect(image)
+
+        strict_flags, lenient_subs = [], []
+        for req in include:
+            classname = req["class"]
+            expected = req.get("count", 1)
+            color = req.get("color", None)
+            position = req.get("position", None)
+            cidx = self._name_to_idx.get(classname)
+            if cidx is None:
+                strict_flags.append(False); lenient_subs.append(0.0); continue
+            cmask = labels == cidx
+            cbb, csc = bboxes[cmask], scores[cmask]
+            if expected > 1 or (exclude and any(e.get("class") == classname for e in exclude)):
+                cbb = cbb[csc >= self._count_thresh]
+            if len(cbb) > self._max_objects:
+                cbb = cbb[: self._max_objects]
+            found = len(cbb)
+            count_reward = max(0.0, 1.0 - abs(expected - found) / expected)
+            count_correct = (found == expected)
+
+            # only_strict speedup: a wrong count can never be strict-correct -> skip CLIP/position.
+            if only_strict and not count_correct:
+                strict_flags.append(False); lenient_subs.append(0.0); continue
+
+            if color and found > 0:
+                colored = sum(
+                    1 for bb in cbb[:expected]
+                    if self._classify_color(image, bb, classname) == color
+                )
+                color_reward = max(0.0, 1.0 - abs(expected - colored) / expected)
+                lenient_subs.append(min(count_reward, color_reward))
+                strict_flags.append(count_correct and colored == expected)
+            elif position and found > 0:
+                relation, ref_idx = position
+                ok = False
+                if ref_idx < len(include):
+                    ridx = self._name_to_idx.get(include[ref_idx]["class"])
+                    if ridx is not None:
+                        rbb = bboxes[labels == ridx]
+                        if len(rbb) > 0 and len(cbb) > 0:
+                            ok = _geneval_check_position(rbb[0], cbb[0], relation)
+                lenient_subs.append(count_reward if ok else 0.0)
+                strict_flags.append(count_correct and ok)
+            else:
+                lenient_subs.append(count_reward)
+                strict_flags.append(count_correct)
+
+        exclude_ok = True
+        if exclude:
+            for exc in exclude:
+                cidx = self._name_to_idx.get(exc["class"])
+                if cidx is None:
+                    continue
+                max_allowed = exc.get("count", 0)
+                found = int((scores[labels == cidx] >= self._count_thresh).sum())
+                if found > max_allowed:
+                    exclude_ok = False
+                    lenient_subs.append(max(0.0, 1.0 - (found - max_allowed) / max(max_allowed, 1)))
+
+        strict = 1.0 if (strict_flags and all(strict_flags) and exclude_ok) else 0.0
+        lenient = (sum(lenient_subs) / len(lenient_subs)) if lenient_subs else 0.0
+        return lenient, strict
+
+
+_GENEVAL_ENGINE = {}
+
+
+def _get_geneval_engine(device):
+    key = str(device)
+    if key not in _GENEVAL_ENGINE:
+        _GENEVAL_ENGINE[key] = _GenEvalEngine(device)
+    return _GENEVAL_ENGINE[key]
+
+
+def geneval_score(device):
+    """IN-ENV GenEval reward (no HTTP server). Loads Mask2Former + CLIP once per device
+    and evaluates each image against its metadata. Same 5-tuple contract as before."""
+    engine = _get_geneval_engine(device)
 
     def _fn(images, prompts, metadatas, only_strict):
         del prompts
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        images_batched = np.array_split(images, np.ceil(len(images) / batch_size))
-        metadatas_batched = np.array_split(metadatas, np.ceil(len(metadatas) / batch_size))
-        all_scores = []
-        all_rewards = []
-        all_strict_rewards = []
-        all_group_strict_rewards = []
-        all_group_rewards = []
-        for image_batch, metadata_batched in zip(images_batched, metadatas_batched):
-            jpeg_images = []
-
-            # Compress the images using JPEG
-            for image in image_batch:
-                img = Image.fromarray(image)
-                buffer = BytesIO()
-                img.save(buffer, format="JPEG")
-                jpeg_images.append(buffer.getvalue())
-
-            # format for LLaVA server
-            data = {
-                "images": jpeg_images,
-                "meta_datas": list(metadata_batched),
-                "only_strict": only_strict,
-            }
-            data_bytes = pickle.dumps(data)
-
-            # send a request to the llava server
-            response = sess.post(url, data=data_bytes, timeout=120)
-            response_data = pickle.loads(response.content)
-
-            all_scores += response_data["scores"]
-            all_rewards += response_data["rewards"]
-            all_strict_rewards += response_data["strict_rewards"]
-            all_group_strict_rewards.append(response_data["group_strict_rewards"])
-            all_group_rewards.append(response_data["group_rewards"])
-        all_group_strict_rewards_dict = defaultdict(list)
-        all_group_rewards_dict = defaultdict(list)
-        for current_dict in all_group_strict_rewards:
-            for key, value in current_dict.items():
-                all_group_strict_rewards_dict[key].extend(value)
-        all_group_strict_rewards_dict = dict(all_group_strict_rewards_dict)
-
-        for current_dict in all_group_rewards:
-            for key, value in current_dict.items():
-                all_group_rewards_dict[key].extend(value)
-        all_group_rewards_dict = dict(all_group_rewards_dict)
-
-        return all_scores, all_rewards, all_strict_rewards, all_group_rewards_dict, all_group_strict_rewards_dict
+        pil_images = _geneval_to_pil_list(images)
+        all_scores, all_rewards, all_strict_rewards = [], [], []
+        group_rewards = defaultdict(list)
+        group_strict_rewards = defaultdict(list)
+        # mmdet's Mask2Former (ms_deform_attn) has no bf16 CUDA kernel and CLIP weights stay
+        # fp32; disable AMP for the whole reward pass (matches Flow-Factory / GenEval reference).
+        with torch.amp.autocast("cuda", enabled=False):
+            for img, meta in zip(pil_images, metadatas):
+                lenient, strict = engine.evaluate_one(img, meta, only_strict)
+                reward = strict if only_strict else lenient
+                tag = meta.get("tag", "overall") if isinstance(meta, dict) else "overall"
+                all_scores.append(strict)          # GRPO training signal = strict reward
+                all_rewards.append(reward)         # accuracy (lenient), or strict when only_strict
+                all_strict_rewards.append(strict)
+                group_rewards[tag].append(reward)
+                group_strict_rewards[tag].append(strict)
+        return all_scores, all_rewards, all_strict_rewards, dict(group_rewards), dict(group_strict_rewards)
 
     return _fn
 
