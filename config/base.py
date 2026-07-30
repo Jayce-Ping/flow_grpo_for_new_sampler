@@ -65,6 +65,9 @@ def get_config():
     sample.sde_window_size = 2
     # sde window range
     sample.sde_window_range = (0, 10)
+    # stochastic transition used for the SDE steps. one of "sde" (Flow-GRPO Euler-Maruyama), "cps",
+    # or "sde_dpm" (SDE-DPM-Solver++ order 1).
+    sample.sde_type = "sde"
     
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()

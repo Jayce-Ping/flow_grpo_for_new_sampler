@@ -244,6 +244,19 @@ def geneval_sd3_fast_nocfg():
     config.per_prompt_stat_tracking = True
     return config
 
+def geneval_sd3_dpm_nocfg():
+    # Same grid and hyper-parameters as `geneval_sd3_fast_nocfg`, so the only variable is the
+    # discretization of the stochastic steps: SDE-DPM-Solver++ order 1 instead of CPS.
+    config = geneval_sd3_fast_nocfg()
+
+    # noise_level is the reverse-SDE diffusion scale lambda (c = lambda**2 * h); 1.0 is exactly the
+    # SDE-DPM-Solver++1 of arXiv:2211.01095 Sec.5. Values != 1 stay marginal-preserving but are no
+    # longer the paper's solver.
+    config.sample.sde_type = "sde_dpm"
+    config.sample.noise_level = 1.0
+    config.save_dir = 'logs/geneval/sd3.5-M-dpm-nocfg'
+    return config
+
 def pickscore_sd3():
     gpu_number=32
     config = compressibility()

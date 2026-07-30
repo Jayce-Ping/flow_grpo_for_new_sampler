@@ -85,6 +85,62 @@ def sde_step_with_logprob(
         # remove all constants
         log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
 
+    elif sde_type == 'sde_dpm':
+        # SDE-DPM-Solver++ order 1 (arXiv:2211.01095 Sec.5) on the flow schedule alpha = 1 - sigma,
+        # generalized to a reverse-SDE diffusion coefficient scaled by lambda = noise_level, which
+        # amounts to replacing the log-SNR step h by c = lambda**2 * h. lambda = 1 is the paper's
+        # solver, lambda = 0 is the deterministic DPM-Solver++1 step (identical to Euler for RF).
+        if noise_level < 0:
+            raise ValueError(
+                f"expected noise_level >= 0 for sde_type='sde_dpm', got {noise_level!r}"
+            )
+        alpha, alpha_prev = 1 - sigma, 1 - sigma_prev
+        # exp(-h) is formed directly instead of via log-SNR so that sigma == 1 (alpha == 0) and
+        # sigma_prev == 0 give 0 rather than log(0) = -inf.
+        exp_neg_h = (alpha * sigma_prev) / (sigma * alpha_prev)
+        if noise_level == 0:
+            # Deterministic step, taken for every out-of-window step and for the whole eval
+            # trajectory; set explicitly rather than leaning on 0**0 == 1 at the endpoints.
+            decay = torch.ones_like(exp_neg_h)
+        else:
+            decay = exp_neg_h ** (noise_level ** 2)  # exp(-lambda**2 * h)
+        std_dev_t = sigma_prev * torch.sqrt(1 - decay ** 2)
+        # std is bounded by sigma_prev, so it collapses on the last steps of the schedule (sigma_prev
+        # is 3e-3 on the second-to-last step of the 10-step SD3.5 grid) and 1/std**2 then blows the
+        # ratio up. A legitimate window sits at std >= 0.25 on that grid, so 1e-2 separates the two.
+        if noise_level > 0 and std_dev_t.min() < 1e-2:
+            raise ValueError(
+                f"sde_dpm std collapsed to {std_dev_t.min().item():.3e} at "
+                f"sigma={sigma.flatten().tolist()} -> sigma_prev={sigma_prev.flatten().tolist()} "
+                f"(noise_level={noise_level}); the log-prob would blow up as 1/std**2. "
+                f"Keep the SDE window away from the final steps via sample.sde_window_range."
+            )
+        pred_original_sample = sample - sigma * model_output  # predicted x_0
+        noise_estimate = sample + alpha * model_output        # predicted x_1
+        # sqrt(sigma_prev**2 - std_dev_t**2) == sigma_prev * decay, so `decay` is used directly to
+        # keep the coefficient exact and remove the negative-under-sqrt failure mode entirely.
+        prev_sample_mean = pred_original_sample * alpha_prev + noise_estimate * sigma_prev * decay
+
+        if prev_sample is None:
+            variance_noise = randn_tensor(
+                model_output.shape,
+                generator=generator,
+                device=model_output.device,
+                dtype=model_output.dtype,
+            )
+            prev_sample = prev_sample_mean + std_dev_t * variance_noise
+
+        log_prob = (
+            -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * std_dev_t**2)
+            - torch.log(std_dev_t)
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+
+    else:
+        raise ValueError(
+            f"expected sde_type in ('sde', 'cps', 'sde_dpm'), got {sde_type!r}"
+        )
+
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
     
